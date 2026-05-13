@@ -24,11 +24,13 @@ from typing import List, Dict, Any, Tuple
 from pathlib import Path
 from dotenv import load_dotenv
 from langchain_core.prompts import ChatPromptTemplate
+from langsmith import Client
+from langsmith.evaluation import evaluate as ls_evaluate
 from src.utils import check_env_vars, format_score, print_section_header, load_yaml
 from src.llm_provider import get_llm, get_eval_llm
 from src.metrics import (
-    evaluate_f1_score, 
-    evaluate_clarity, 
+    evaluate_f1_score,
+    evaluate_clarity,
     evaluate_precision,
     calculate_helpfulness,
     calculate_correctness
@@ -307,6 +309,86 @@ def format_evaluation_output(results: Dict[str, Any]) -> str:
     return "\n".join(output)
 
 
+def upload_dataset_to_langsmith(jsonl_path: str, dataset_name: str = "bug_to_user_story") -> str:
+    """
+    Cria (ou reutiliza) dataset no LangSmith a partir do JSONL local.
+    Retorna o nome do dataset.
+    """
+    client = Client()
+
+    existing = [d for d in client.list_datasets() if d.name == dataset_name]
+    if existing:
+        print(f"✓ Dataset '{dataset_name}' já existe no LangSmith")
+        return dataset_name
+
+    dataset = client.create_dataset(dataset_name, description="15 bug reports para avaliação de user stories")
+
+    with open(jsonl_path, "r", encoding="utf-8") as f:
+        examples = [json.loads(line) for line in f if line.strip()]
+
+    client.create_examples(
+        inputs=[e["inputs"] for e in examples],
+        outputs=[e["outputs"] for e in examples],
+        dataset_id=dataset.id,
+    )
+    print(f"✓ Dataset '{dataset_name}' criado com {len(examples)} exemplos")
+    return dataset_name
+
+
+def run_langsmith_evaluation(prompt_template: ChatPromptTemplate, dataset_name: str = "bug_to_user_story") -> None:
+    """
+    Executa avaliação como experimento no LangSmith usando langsmith.evaluation.evaluate().
+    Os resultados ficam visíveis em Datasets & Experiments no hub.
+    """
+    print("\n" + "=" * 70)
+    print("EXECUTANDO EXPERIMENTO NO LANGSMITH")
+    print("=" * 70)
+
+    llm = get_llm(temperature=0)
+    chain = prompt_template | llm
+
+    def target(inputs: Dict[str, Any]) -> Dict[str, Any]:
+        response = chain.invoke({"bug_report": inputs["bug_report"]})
+        return {"output": response.content}
+
+    def eval_clarity(outputs: Dict, reference_outputs: Dict, inputs: Dict) -> Dict:
+        result = evaluate_clarity(inputs["bug_report"], outputs["output"], reference_outputs["reference"])
+        return {"key": "clarity", "score": result["score"]}
+
+    def eval_precision(outputs: Dict, reference_outputs: Dict, inputs: Dict) -> Dict:
+        result = evaluate_precision(inputs["bug_report"], outputs["output"], reference_outputs["reference"])
+        return {"key": "precision", "score": result["score"]}
+
+    def eval_f1_score(outputs: Dict, reference_outputs: Dict, inputs: Dict) -> Dict:
+        result = evaluate_f1_score(inputs["bug_report"], outputs["output"], reference_outputs["reference"])
+        return {"key": "f1_score", "score": result["score"]}
+
+    def eval_helpfulness(outputs: Dict, reference_outputs: Dict, inputs: Dict) -> Dict:
+        clarity = evaluate_clarity(inputs["bug_report"], outputs["output"], reference_outputs["reference"])
+        precision = evaluate_precision(inputs["bug_report"], outputs["output"], reference_outputs["reference"])
+        score = calculate_helpfulness(clarity["score"], precision["score"])
+        return {"key": "helpfulness", "score": score}
+
+    def eval_correctness(outputs: Dict, reference_outputs: Dict, inputs: Dict) -> Dict:
+        f1 = evaluate_f1_score(inputs["bug_report"], outputs["output"], reference_outputs["reference"])
+        precision = evaluate_precision(inputs["bug_report"], outputs["output"], reference_outputs["reference"])
+        score = calculate_correctness(f1["score"], precision["score"])
+        return {"key": "correctness", "score": score}
+
+    try:
+        ls_evaluate(
+            target,
+            data=dataset_name,
+            evaluators=[eval_clarity, eval_precision, eval_f1_score, eval_helpfulness, eval_correctness],
+            experiment_prefix="bug_to_user_story_v2",
+            metadata={"prompt_version": "v2", "techniques": ["few-shot", "cot", "role-prompting", "structured-output"]},
+        )
+        print(f"\n✅ Experimento criado no LangSmith!")
+        print(f"   Veja em: https://smith.langchain.com/o/default/datasets")
+    except Exception as e:
+        print(f"⚠️  Erro ao criar experimento LangSmith: {e}")
+
+
 def main():
     """
     Script de entrada para orquestração completa de avaliação.
@@ -413,6 +495,13 @@ def main():
     output = format_evaluation_output(aggregated)
     print(output)
     
+    # Executar experimento no LangSmith
+    try:
+        dataset_name = upload_dataset_to_langsmith(jsonl_path)
+        run_langsmith_evaluation(prompt_template, dataset_name)
+    except Exception as e:
+        print(f"⚠️  Avaliação LangSmith falhou: {e}")
+
     # Retornar exit code apropriado
     if aggregated["passed"]:
         print("\n✅ Todos os prompts atingiram todas as métricas >= 0.9!")
